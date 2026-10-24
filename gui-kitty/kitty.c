@@ -35,7 +35,7 @@
 
 #include <pthread.h>
 #include <termios.h>
-#include <poll.h>
+#include <sys/select.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -45,6 +45,29 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <zlib.h>
+
+/*
+ * wait up to ms for input on a or b; set *ra, *rb if there is.
+ * select, not poll: poll does not do ttys on macOS.  it lives
+ * up here because the fd_set macros break under u.h's defines.
+ */
+static int
+waitfd(int a, int b, int ms, int *ra, int *rb)
+{
+	struct timeval tv;
+	fd_set rd;
+	int n;
+
+	FD_ZERO(&rd);
+	FD_SET(a, &rd);
+	FD_SET(b, &rd);
+	tv.tv_sec = ms/1000;
+	tv.tv_usec = (ms%1000)*1000;
+	n = select((a > b ? a : b)+1, &rd, NULL, NULL, &tv);
+	*ra = n > 0 && FD_ISSET(a, &rd);
+	*rb = n > 0 && FD_ISSET(b, &rd);
+	return n;
+}
 
 #include "u.h"
 #include "lib.h"
@@ -1699,26 +1722,21 @@ static int
 readtty(int timeout)
 {
 	uchar buf[8192];
-	struct pollfd pfd[2];
 	char c;
-	int i, n;
+	int i, n, intty, insig;
 
-	pfd[0].fd = kt.fd;
-	pfd[0].events = POLLIN;
-	pfd[1].fd = kt.sigfd[0];
-	pfd[1].events = POLLIN;
-	n = poll(pfd, 2, timeout);
+	n = waitfd(kt.fd, kt.sigfd[0], timeout, &intty, &insig);
 	if(n < 0)
 		return errno == EINTR ? 0 : -1;
 	if(n == 0)
 		return 0;
-	if(pfd[1].revents & POLLIN){
+	if(insig){
 		while(read(kt.sigfd[0], &c, 1) == 1)
 			;
 		if(!kt.probing)
 			winsize();
 	}
-	if(pfd[0].revents & (POLLIN|POLLHUP|POLLERR)){
+	if(intty){
 		n = read(kt.fd, buf, sizeof buf);
 		if(n < 0)
 			return errno == EINTR || errno == EAGAIN ? 0 : -1;
