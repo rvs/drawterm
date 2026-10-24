@@ -1,0 +1,20 @@
+# Unix, drawing inside a terminal emulator that speaks
+# the kitty graphics and keyboard protocols (Ghostty, kitty).
+# No window system needed; links only against zlib.
+PTHREAD=-pthread
+AR=ar
+AS=as
+RANLIB=ranlib
+CC=cc
+CFLAGS=-Wall -Wno-missing-braces -Wno-parentheses -Wno-unused-result -ggdb -I$(ROOT) -I$(ROOT)/include -I$(ROOT)/kern -c -D_THREAD_SAFE -DPTHREAD $(PTHREAD) -O2
+O=o
+OS=posix
+GUI=kitty
+LDADD=-ggdb -lm -lz $(RT)
+# shm_open lives in librt on older glibc
+RT=$(if $(filter Linux,$(shell uname)),-lrt)
+LDFLAGS=$(PTHREAD)
+TARG=drawterm
+AUDIO=none
+
+all: default
