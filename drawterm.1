@@ -159,6 +159,65 @@ Unless otherwise specified, the address stored in $auth is used for the
 .IR rcpu (1)
 connection (if set).
 
+.IP DTKITTY
+Options for a drawterm built with
+.B CONF=kitty
+(see below), separated by commas:
+.RS
+.TP
+.BR shm ", " noshm
+Always or never pass pixels through POSIX shared memory.
+By default it is used when the terminal can open it, that is when both run on the same machine.
+.TP
+.BR frames ", " noframes
+Always or never send damage as in-place edits of one image (animation frames, action
+.BR a=f ).
+By default they are used when the terminal supports them; otherwise the screen is a grid of tiles.
+.TP
+.BI fps= n
+Send at most
+.I n
+updates a second (60).
+.TP
+.BI z= n
+Zlib level for pixels sent inline, 0 for none (1).
+.TP
+.BI tile= n
+Tile size in pixels, rounded to whole cells (128).
+.TP
+.BI cursor= n
+Draw the Plan 9 cursor never (0), always (1), or unless it is the arrow, leaving the terminal's pointer alone (2, the default).
+.TP
+.B emu
+Alt-click is button 2 and ctrl-click is button 3, for one-button pointers.
+.TP
+.B clipread
+Read the host clipboard with OSC 52 when Plan 9 reads
+.BR /dev/snarf .
+Terminals may ask before answering, so this is off and only what was snarfed in drawterm is pasted.
+.TP
+.BI debug= file
+Log the terminal's capabilities, frames and keys to
+.IR file .
+.RE
+
+.PP
+.SH KITTY TERMINALS
+Built with
+.BR "CONF=kitty make" ,
+drawterm opens no window: it takes over the terminal it was started in (on the alternate screen) and draws the Plan 9 screen with the kitty graphics protocol.
+It asks the terminal what it supports and refuses to start if graphics are missing, as in tmux or screen.
+Ghostty is the reference; kitty works as well.
+The screen is the terminal's text area rounded down to whole cells, and follows its size.
+.PP
+Keys are read with the kitty keyboard protocol, which reports releases and bare modifiers, so Alt composes as on Plan 9.
+Keys the terminal claims for itself (copy, paste, new tab) never reach drawterm; unbind them for a full keyboard.
+The mouse is reported in pixels; buttons 1 to 3 and the wheel are passed on, but most terminals keep shift-click for their own text selection.
+Text pasted in the terminal is typed.
+.PP
+When the session ends drawterm restores the terminal and exits; any other panic stays on the screen until a key is pressed.
+What drawterm prints while it owns the terminal is shown after it exits.
+
 .PP
 .SH SERVICES
 A number of services are provided in drawterm. The exact functionality and availability of certain features may be dependent on your platform or architecture: 
