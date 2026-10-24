@@ -61,6 +61,7 @@
 #undef atexit	/* we want the host's: restore the terminal on any exit */
 
 extern void	exits(char*);	/* from user.h, which we cannot include */
+extern int	panicking;	/* kern/devcons.c */
 
 typedef struct Buf Buf;
 typedef struct Csi Csi;
@@ -200,6 +201,9 @@ static struct
 	int	altmouse;
 	Down	down[Ndown];
 	int	ndown;
+
+	/* the session is over but the kernel hangs to show why */
+	char	*dead;
 } kt = {
 	.fd = -1,
 	.logfd = -1,
@@ -212,6 +216,7 @@ Memimage *gscreen;
 
 static void	inbyte(int);
 static void	kick(void);
+static void	quit(void);
 
 static void
 dbg(char *fmt, ...)
@@ -1004,6 +1009,8 @@ keydown(int id, Rune r, int repeat)
 
 	if(r == 0)
 		return;
+	if(kt.dead != nil)
+		quit();
 	for(i = 0; i < kt.ndown; i++)
 		if(kt.down[i].id == id){
 			if(kt.down[i].r != r)
@@ -1075,6 +1082,8 @@ typekey(Rune r)
 {
 	if(r == 0)
 		return;
+	if(kt.dead != nil)
+		quit();
 	kbdkey(r, 1);
 	kbdkey(r, 0);
 }
@@ -1721,24 +1730,84 @@ readtty(int timeout)
 	return 1;
 }
 
+/*
+ * leave without exits: its handlers would panic and hang.
+ * the host atexit handler gives back the terminal.
+ */
+static void
+quit(void)
+{
+	ttyexit();
+	if(kt.dead != nil && strcmp(kt.dead, "ending") != 0)
+		fprintf(stderr, "drawterm: panic: %s\n", kt.dead);
+	exit(kt.dead != nil && strcmp(kt.dead, "ending") != 0);
+}
+
+/*
+ * the kernel panicked and hangs to keep the message on the
+ * screen, as it would in a window.  the end of the session
+ * also comes this way, as panic("ending"): just leave then;
+ * otherwise wait for a key so the message can be read.
+ */
+static void
+dying(void)
+{
+	char msg[256], *p, *e;
+	int n;
+
+	osmsleep(200);	/* let panic draw */
+	ilock(&kmesg.lk);
+	n = kmesg.n;
+	if(n > sizeof kmesg.buf)
+		n = sizeof kmesg.buf;
+	memmove(msg, "?", 2);
+	for(p = kmesg.buf+n-7; p >= kmesg.buf; p--)
+		if(memcmp(p, "panic: ", 7) == 0){
+			p += 7;
+			e = memchr(p, '\n', kmesg.buf+n-p);
+			if(e == nil)
+				e = kmesg.buf+n;
+			if(e-p >= sizeof msg)
+				e = p+sizeof msg-1;
+			memmove(msg, p, e-p);
+			msg[e-p] = 0;
+			break;
+		}
+	iunlock(&kmesg.lk);
+	kt.dead = strdup(msg);
+	dbg("panic: %s", kt.dead);
+	if(strcmp(kt.dead, "ending") == 0)
+		quit();
+	ttyprint("\033]2;drawterm: %s (press a key)\033\\", kt.dead);
+}
+
 static void
 inproc(void *v)
 {
-	int n;
+	int n, t;
 
 	USED(v);
 	for(;;){
-		/* a lone escape is the escape key, unless the protocol says otherwise */
-		n = readtty(in.state == Sesc ? 30 : -1);
+		/*
+		 * a lone escape is the escape key, unless the protocol
+		 * says otherwise.  look out for a panic now and then.
+		 */
+		t = 500;
+		if(in.state == Sesc)
+			t = 30;
+		n = readtty(t);
 		if(n < 0)
 			break;
 		if(n == 0 && in.state == Sesc){
 			in.state = Sground;
 			typekey(Kesc);
 		}
+		if(panicking && kt.dead == nil)
+			dying();
 	}
+	/* the terminal went away */
 	ttyrestore();
-	exits(nil);
+	exit(0);
 }
 
 /*
