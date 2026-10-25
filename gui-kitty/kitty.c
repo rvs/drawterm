@@ -1690,8 +1690,13 @@ resize(int cols, int rows, int w, int h)
 	}
 	pthread_mutex_unlock(&kt.lk);
 	dbg("size %dx%d cells of %dx%d", cols, rows, cw, ch);
-	if(!same)
-		screenresize(r);	/* screensize will send it all */
+	/*
+	 * even if r is the current size: it replaces any other size
+	 * still pending in resizeproc (docker reports stale sizes).
+	 * when it differs, screensize will send it all.
+	 */
+	if(gscreen != nil)
+		screenresize(r);
 }
 
 static void
@@ -1733,7 +1738,8 @@ readtty(int timeout)
 	if(insig){
 		while(read(kt.sigfd[0], &c, 1) == 1)
 			;
-		if(!kt.probing)
+		/* in-band reports (mode 2048) are exact and never stale */
+		if(!kt.probing && !kt.inband)
 			winsize();
 	}
 	if(intty){
