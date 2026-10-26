@@ -1,0 +1,152 @@
+# Build drawterm with the kitty terminal backend (CONF=kitty) for
+# Linux amd64, Linux arm64 and macOS arm64.
+#
+# Every build uploads one tar.gz per platform as a workflow
+# artifact.  Pushing a tag that starts with v (v1.0, v1.1-rc1, ...)
+# also publishes a GitHub release with the tarballs attached; a tag
+# with a hyphen in it becomes a pre-release.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: macos-arm64
+            os: macos-15
+    env:
+      # oldest macOS the binary will run on
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev
+
+      - name: Build
+        run: make CONF=kitty -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${GITHUB_SHA::7}"
+          fi
+          name="drawterm-kitty-$version-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp drawterm drawterm.1 README LICENSE "dist/$name/"
+          strip "dist/$name/drawterm"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            # strip invalidates the linker's ad-hoc signature, and
+            # arm64 macOS will not run unsigned code
+            codesign --force --sign - "dist/$name/drawterm"
+          fi
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="dist/${{ steps.package.outputs.name }}/drawterm"
+          file "$bin"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            ldd "$bin"
+            echo "needs $(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          else
+            otool -L "$bin"
+            vtool -show-build "$bin" || true
+          fi
+          # it must load and get as far as argument parsing
+          out=$("$bin" -Z 2>&1 || true)
+          echo "$out"
+          [[ "$out" == usage:* ]]
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/${{ steps.package.outputs.name }}.tar.gz
+          archive: false
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: drawterm-kitty-*
+          path: download
+
+      - name: Collect
+        run: |
+          mkdir dist
+          find download -type f -name 'drawterm-kitty-*.tar.gz' -exec mv {} dist/ \;
+          cd dist
+          ls -l
+          test "$(find . -name '*.tar.gz' | wc -l)" -eq 3
+          sha256sum -- *.tar.gz >SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat >notes.md <<NOTES
+          drawterm with the kitty backend: it runs inside a terminal that
+          speaks the kitty graphics and keyboard protocols (Ghostty, kitty)
+          instead of opening a window.  Plain text mode (-G) works anywhere.
+
+          | file | for |
+          |---|---|
+          | drawterm-kitty-$TAG-linux-amd64.tar.gz | Linux x86_64, glibc 2.34 or newer (Ubuntu 22.04 and later) |
+          | drawterm-kitty-$TAG-linux-arm64.tar.gz | Linux aarch64, glibc 2.34 or newer (Ubuntu 22.04 and later) |
+          | drawterm-kitty-$TAG-macos-arm64.tar.gz | macOS 11 or newer on Apple silicon |
+
+          Usage: \`drawterm -h cpu -a auth -u user\` from a Ghostty or kitty
+          window.  Options go in \`\$DTKITTY\`; see the KITTY TERMINALS section
+          of drawterm.1 (\`man ./drawterm.1\`).
+
+          The macOS binary is not notarized.  If a browser download is
+          refused, run \`xattr -d com.apple.quarantine drawterm\`.
+          NOTES
+          flags=()
+          if [[ "$TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "drawterm-kitty $TAG" --notes-file notes.md "${flags[@]}"
+          fi
