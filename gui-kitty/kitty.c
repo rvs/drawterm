@@ -2,10 +2,12 @@
  * drawterm inside a terminal emulator.
  *
  * Output uses the kitty graphics protocol.  The Plan 9 screen is
- * one image placed at the top left cell; damage is sent as in-place
- * edits of its root frame (a=f).  Terminals that cannot edit frames
- * get a grid of cell-aligned tiles instead, each damaged tile being
- * retransmitted whole.  The Plan 9 cursor is a small image placed
+ * a grid of cell-aligned tiles, each an image placed once.  Damage
+ * is sent as in-place edits of the tiles' root frames (a=f), so the
+ * terminal moves only the damaged pixels to the GPU: Ghostty and
+ * kitty upload a changed image whole.  Terminals that cannot edit
+ * frames get each damaged tile retransmitted whole.  The Plan 9
+ * cursor is a small image placed
  * above the screen and moved by re-placing it.  Pixels go through
  * POSIX shared memory when the terminal can open it (same host),
  * otherwise inline as zlib-compressed base64.
@@ -123,18 +125,18 @@ enum
 {
 	/* image ids, unlikely to clash with anybody else's */
 	Idbase		= 0x44540000,
-	Idscreen	= Idbase+1,
 	Idcursor	= Idbase+2,
 	Idprobe		= Idbase+3,	/* 3 of them */
 	Idtile		= Idbase+0x100,
 
 	Ndirty		= 32,
 	Slack		= 32*32,	/* merge damage that wastes less */
-	Nshm		= 256,
+	Nshm		= 4096,		/* > 2 frames of Maxtiles */
 	Chunk		= 4096,		/* base64 bytes per APC */
 	Maxstr		= 8*1024*1024,	/* longest OSC/APC/DCS we accept */
 	Ndown		= 64,
-	Tilesz		= 128,
+	Tilesz		= 256,
+	Maxtiles	= 1024,
 
 	/* kitty keyboard flags: disambiguate, events, alternates, all keys, text */
 	Kbdflags	= 1|2|4|8|16,
@@ -597,10 +599,29 @@ torgb(uchar *d, Memimage *m, Rectangle r)
 	}
 }
 
-static int
-tilesz(int cell)
+/*
+ * the size of the tiles covering r: whole cells, at least
+ * kt.tilesz pixels, no more than Maxtiles of them.
+ * tilesz 0 makes the whole screen one image.
+ */
+static void
+tiling(Rectangle r, int *tw, int *th)
 {
-	return cell * ((kt.tilesz+cell-1)/cell);
+	int w, h;
+
+	if(kt.tilesz == 0){
+		*tw = Dx(r) > 0 ? Dx(r) : 1;
+		*th = Dy(r) > 0 ? Dy(r) : 1;
+		return;
+	}
+	w = kt.cw * ((kt.tilesz+kt.cw-1)/kt.cw);
+	h = kt.ch * ((kt.tilesz+kt.ch-1)/kt.ch);
+	while(((Dx(r)+w-1)/w) * ((Dy(r)+h-1)/h) > Maxtiles){
+		w *= 2;
+		h *= 2;
+	}
+	*tw = w;
+	*th = h;
 }
 
 /*
@@ -611,9 +632,10 @@ static void
 outproc(void *v)
 {
 	static Buf b, pix;
-	static Rectangle *sr;
-	static int nsr;
-	Rectangle d[Ndirty], r, sc;
+	static Rectangle *box;
+	static int *sent;
+	static int nsent;
+	Rectangle d[Ndirty], r, t, sc;
 	int nd, full, shape, move, i, j, k, n, tw, th, ntx, nty, frames;
 	uchar *mark, rgba[16*16*4], *p;
 	Point pt, off, curoff;
@@ -685,55 +707,60 @@ outproc(void *v)
 		}
 		sc = gscreen->r;
 
-		/* what to send */
-		nsr = 0;
-		tw = th = ntx = nty = 0;
-		if(frames){
-			if(full){
-				nd = 1;
-				d[0] = sc;
-			}
-			sr = realloc(sr, (nd+1)*sizeof sr[0]);
-			for(i = 0; i < nd; i++){
-				r = d[i];
-				if(rectclip(&r, sc))
-					sr[nsr++] = r;
-			}
-		}else{
-			tw = tilesz(kt.cw);
-			th = tilesz(kt.ch);
-			ntx = (Dx(sc)+tw-1)/tw;
-			nty = (Dy(sc)+th-1)/th;
-			mark = realloc(mark, ntx*nty);
-			memset(mark, full, ntx*nty);
-			for(i = 0; i < nd; i++){
-				r = d[i];
-				if(!rectclip(&r, sc))
-					continue;
-				for(j = r.min.y/th; j <= (r.max.y-1)/th; j++)
-					for(k = r.min.x/tw; k <= (r.max.x-1)/tw; k++)
-						mark[j*ntx+k] = 1;
-			}
-			sr = realloc(sr, (ntx*nty+1)*sizeof sr[0]);
-			for(i = 0; i < ntx*nty; i++)
-				if(mark[i]){
-					r = Rect(0, 0, tw, th);
-					r = rectaddpt(r, Pt((i%ntx)*tw, (i/ntx)*th));
-					rectclip(&r, sc);
-					sr[nsr++] = r;
+		/*
+		 * what to send: the damage within each tile, or
+		 * all of it when it is new or cannot be edited.
+		 */
+		tiling(sc, &tw, &th);
+		ntx = (Dx(sc)+tw-1)/tw;
+		nty = (Dy(sc)+th-1)/th;
+		mark = realloc(mark, ntx*nty);
+		box = realloc(box, ntx*nty*sizeof box[0]);
+		sent = realloc(sent, ntx*nty*sizeof sent[0]);
+		memset(mark, 0, ntx*nty);
+		if(full){
+			nd = 1;
+			d[0] = sc;
+		}
+		for(i = 0; i < nd; i++){
+			r = d[i];
+			if(!rectclip(&r, sc))
+				continue;
+			for(j = r.min.y/th; j <= (r.max.y-1)/th; j++)
+				for(k = r.min.x/tw; k <= (r.max.x-1)/tw; k++){
+					n = j*ntx + k;
+					t = Rect(k*tw, j*th, (k+1)*tw, (j+1)*th);
+					rectclip(&t, sc);
+					if(full || !frames)
+						box[n] = t;
+					else if(!mark[n]){
+						box[n] = r;
+						rectclip(&box[n], t);
+					}else{
+						combinerect(&box[n], r);
+						rectclip(&box[n], t);
+					}
+					mark[n] = 1;
 				}
 		}
+		nsent = 0;
+		for(i = 0; i < ntx*nty; i++)
+			if(mark[i])
+				sent[nsent++] = i;
 
 		/* copy the pixels out quickly */
 		n = 0;
-		for(i = 0; i < nsr; i++)
-			n += Dx(sr[i])*Dy(sr[i])*3;
+		for(i = 0; i < nsent; i++){
+			r = box[sent[i]];
+			n += Dx(r)*Dy(r)*3;
+		}
 		pix.n = 0;
 		bgrow(&pix, n);
 		p = (uchar*)pix.p;
-		for(i = 0; i < nsr; i++){
-			torgb(p, gscreen, sr[i]);
-			p += Dx(sr[i])*Dy(sr[i])*3;
+		for(i = 0; i < nsent; i++){
+			r = box[sent[i]];
+			torgb(p, gscreen, r);
+			p += Dx(r)*Dy(r)*3;
 		}
 		qunlock(&drawlock);
 
@@ -764,17 +791,18 @@ outproc(void *v)
 		if(full)
 			bputs(&b, "\033_Ga=d,d=A,q=2\033\\");
 		p = (uchar*)pix.p;
-		for(i = 0; i < nsr; i++){
-			r = sr[i];
+		for(i = 0; i < nsent; i++){
+			r = box[sent[i]];
 			n = Dx(r)*Dy(r)*3;
+			t = rectaddpt(Rect(0, 0, tw, th), Pt((sent[i]%ntx)*tw, (sent[i]/ntx)*th));
 			if(frames && !full)
 				snprint(keys, sizeof keys, "a=f,i=%d,r=1,x=%d,y=%d,s=%d,v=%d,X=1,f=24,q=1",
-					Idscreen, r.min.x, r.min.y, Dx(r), Dy(r));
+					Idtile+sent[i], r.min.x-t.min.x, r.min.y-t.min.y, Dx(r), Dy(r));
 			else{
+				/* placing it again replaces the placement */
 				off = cellat(&b, r.min);
 				snprint(keys, sizeof keys, "a=T,i=%d,p=1,s=%d,v=%d,X=%d,Y=%d,C=1,z=0,f=24,q=1",
-					frames ? Idscreen : Idtile + (r.min.y/th)*ntx + r.min.x/tw,
-					Dx(r), Dy(r), off.x, off.y);
+					Idtile+sent[i], Dx(r), Dy(r), off.x, off.y);
 			}
 			gfxdata(&b, keys, p, n);
 			p += n;
@@ -808,14 +836,14 @@ outproc(void *v)
 			kt.curshown = 0;
 		if(kt.sync)
 			bputs(&b, "\033[?2026l");
-		if(kt.ackok && (nsr > 0 || shape || move)){
+		if(kt.ackok && (nsent > 0 || shape || move)){
 			bputs(&b, "\033[5n");
 			pthread_mutex_lock(&kt.lk);
 			kt.sent++;
 			pthread_mutex_unlock(&kt.lk);
 		}
 		ttywrite(b.p, b.n);
-		dbg("frame full=%d frames=%d rects=%d cursor=%d/%d bytes=%d", full, frames, nsr, shape, move, b.n);
+		dbg("frame full=%d frames=%d tiles=%d/%d cursor=%d/%d bytes=%d", full, frames, nsent, ntx*nty, shape, move, b.n);
 		if(b.cap > 1<<20){
 			free(b.p);
 			memset(&b, 0, sizeof b);
@@ -1891,10 +1919,10 @@ probe(void)
 /*
  * $DTKITTY: comma separated
  *	shm, noshm	pixels via shared memory, or never (default: if it works)
- *	frames, noframes	edit one image in place, or use tiles (default: if it works)
+ *	frames, noframes	edit tiles in place, or send damaged tiles whole (default: if it works)
  *	fps=n	frames a second at most (60)
  *	z=n	zlib level for inline pixels, 0 for none (1)
- *	tile=n	tile size when not using frames (128)
+ *	tile=n	tile size in pixels, 0 for one image (256)
  *	cursor=n	0: never draw the plan 9 cursor, 1: always, 2: unless it is the arrow (2)
  *	emu	alt-click is button 2, ctl-click is button 3
  *	clipread	read the host clipboard (OSC 52) on paste
@@ -1950,7 +1978,7 @@ options(void)
 		kt.fps = 1000;
 	if(kt.zlevel > 9)
 		kt.zlevel = 9;
-	if(kt.tilesz < 16)
+	if(kt.tilesz != 0 && kt.tilesz < 16)
 		kt.tilesz = 16;
 	free(s);
 }
