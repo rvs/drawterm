@@ -170,9 +170,13 @@ Always or never pass pixels through POSIX shared memory.
 By default it is used when the terminal can open it, that is when both run on the same machine.
 .TP
 .BR frames ", " noframes
-Always or never send damage as in-place edits of one image (animation frames, action
-.BR a=f ).
-By default they are used when the terminal supports them; otherwise the screen is a grid of tiles.
+The screen is a grid of tiles, each an image placed once.
+Damage is sent as in-place edits of the tiles (animation frames, action
+.BR a=f ),
+so the terminal re-uploads only the tiles it touched; with
+.B noframes
+damaged tiles are sent whole.
+By default edits are used when the terminal supports them.
 .TP
 .BI fps= n
 Send at most
@@ -183,7 +187,8 @@ updates a second (60).
 Zlib level for pixels sent inline, 0 for none (1).
 .TP
 .BI tile= n
-Tile size in pixels, rounded to whole cells (128).
+Tile size in pixels, rounded to whole cells (256);
+0 makes the whole screen one image.
 .TP
 .BI cursor= n
 Draw the Plan 9 cursor never (0), always (1), or unless it is the arrow, leaving the terminal's pointer alone (2, the default).
