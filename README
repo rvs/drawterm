@@ -15,7 +15,7 @@ To build on Solaris using Sun cc, run CONF=sun make.
 To build a drawterm that draws inside a terminal emulator speaking the
 kitty graphics and keyboard protocols (Ghostty, kitty) instead of
 opening a window, run CONF=kitty make.  It needs zlib and no window
-system; see KITTY TERMINALS in drawterm(1).
+system; see KITTY TERMINALS in drawterm(1) and README.kitty.
 
 To build on Windows, you can't use Visual C. Use Mingw on cygwin.
 

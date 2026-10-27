@@ -1,0 +1,423 @@
+DRAWTERM IN A TERMINAL: THE KITTY BACKEND
+=========================================
+
+CONF=kitty builds a drawterm that opens no window.  It takes over
+the terminal emulator it is started in and draws the Plan 9 screen
+there with the kitty graphics protocol, reading the keyboard and
+mouse through the kitty keyboard protocol and SGR pixel mouse
+reports.  It links against nothing but libc, libpthread and zlib,
+so one binary works over ssh, on a console-only machine, or on a
+Mac without XQuartz.
+
+Ghostty is the reference terminal and the one the code is tuned
+for; kitty works as well.  Usage is in drawterm(1): see the DTKITTY
+variable and the KITTY TERMINALS section.  This file describes how
+the backend works and what is left to do.
+
+
+FILES
+-----
+Make.kitty	build configuration: GUI=kitty, AUDIO=none,
+		links -lz (and -lrt on Linux for shm_open)
+gui-kitty/kitty.c	the whole backend, about 2100 lines
+kern/devdraw.c	one general fix (see DAMAGE below)
+drawterm.1	DTKITTY options, KITTY TERMINALS
+
+
+STRUCTURE
+---------
+The backend implements the usual drawterm screen interface
+(kern/screen.h): screeninit, screensize, flushmemscreen,
+attachscreen, setcursor, mouseset, getcolor/setcolor, clipread,
+clipwrite and guimain.  gscreen is a soft screen in XRGB32 that
+devdraw draws into; flushmemscreen only records damage.
+
+Two kprocs do the work:
+
+  kittyout (outproc)	the only writer to the terminal.  It
+		wakes on damage, cursor changes or pending escape
+		sequences, copies the damaged pixels out under
+		drawlock, encodes them and writes one frame.
+  kittyin (inproc)	the only reader.  It parses everything
+		the terminal sends (keys, mouse, replies, resize
+		reports, pastes) and feeds kbdkey and
+		absmousetrack.
+
+Shared output state (damage list, cursor, pending sequences,
+flow-control counters, clipboard) lives in one struct under a
+pthread mutex with a condition variable; the writer sleeps on it.
+
+
+STARTUP
+-------
+1. Options are read from $DTKITTY.
+
+2. stdout and stderr, if they are the terminal, are redirected to
+   an unlinked temporary file so stray prints cannot scribble over
+   the picture.  The last 8KB are shown on stderr when drawterm
+   exits.
+
+3. /dev/tty is put in raw mode and these modes are set:
+
+	CSI ?1049h		alternate screen
+	CSI ?25l		no text cursor
+	CSI 22;2t		save the window title
+	CSI ?1000h ?1002h ?1003h	all mouse motion
+	CSI ?1006h ?1016h	SGR mouse reports, in pixels
+	CSI ?1004h		focus events
+	CSI ?2004h		bracketed paste
+	CSI ?2048h		in-band resize reports
+
+   An atexit handler and handlers for SIGTERM, SIGINT, SIGQUIT and
+   SIGHUP undo all of it (async-signal-safe), pop the keyboard
+   flags, delete our images and unlink any shared memory objects
+   left behind.
+
+4. The terminal is probed in one write, and its answers are read
+   until the primary device attributes come back (terminals answer
+   in order, so DA1 marks the end; 5 s timeout):
+
+	a=q, t=d		kitty graphics at all
+	a=q, t=s		can it open our POSIX shared memory
+	a=t, a=f, a=d		can it edit frames in place (a=f)
+	CSI ?u			kitty keyboard protocol
+	CSI ?2026$p ?1016$p ?2048$p	synchronized output, pixel
+				mouse, in-band resize (DECRQM)
+	CSI 14t, CSI 16t	text area and cell size in pixels
+	CSI >q			name and version (XTVERSION)
+	CSI 5n			does it answer status reports
+	CSI c			DA1, the end marker
+
+   Without graphics drawterm refuses to start (inside tmux or
+   screen, for example).  With the keyboard protocol it pushes
+   flags 31 (CSI >31u: disambiguate, report event types, report
+   alternate keys, report all keys as escapes, report associated
+   text).  The title is set to "drawterm".
+
+5. The size is taken (see RESIZING), gscreen is allocated, the two
+   kprocs start and the Plan 9 console is drawn.
+
+
+OUTPUT
+------
+Tiles.  The screen is a grid of tiles, each a separate image
+placed once.  A tile is a whole number of cells, at least
+tile=n pixels (256 by default) on a side; on a 10x19 cell grid
+that is 260x266.  If the grid would have more than 1024 tiles the
+size doubles until it does not.  Tiles at the right and bottom
+edges are clipped to the screen.  tile=0 makes the whole screen
+one image.
+
+Why tiles: Ghostty (1.3 and 1.4) and kitty upload a changed image
+to the GPU whole.  Ghostty copies the image, converts it and
+creates a new texture on every content change.  With the screen
+as one image a keystroke cost a full-screen upload: 4MB at
+1280x800, 16MB at 2560x1600, about 59MB at 5K.  With tiles only
+the touched tiles are re-uploaded.
+
+Frames.  A full update (start, resize, error recovery) deletes all
+our images (a=d,d=A) and transmits and places every tile:
+
+	CSI row;col H
+	APC G a=T,i=<tile>,p=1,s=w,v=h,X=dx,Y=dy,C=1,z=0,f=24,q=1;...
+
+C=1 keeps the terminal cursor still; z=0 puts the screen under
+the cursor image.  After that, when the terminal can edit frames,
+damage within each tile is sent as an edit of the tile's root
+frame, which leaves the placement alone:
+
+	APC G a=f,i=<tile>,r=1,x=..,y=..,s=..,v=..,X=1,f=24,q=1;...
+
+Terminals without a=f (Ghostty 1.3) get every damaged tile
+retransmitted whole with a=T, which replaces the image and its
+placement in one command.
+
+Pixels.  gscreen is XRGB32; damage is converted to packed RGB
+(f=24) while drawlock is held, then encoded without it.  Pixels
+travel one of two ways:
+
+  shared memory	t=s: each payload is a new POSIX shm object
+		"/dtk<pid>.<seq>", which the terminal maps and
+		unlinks.  Only the name crosses the tty: a
+		keystroke is about 110 bytes.  Used when the probe
+		shows the terminal can open it, i.e. same machine.
+		A ring of the last 4096 names is kept so anything the
+		terminal did not unlink is removed on exit.
+  inline	t=d: zlib (level 1, o=z, only if it shrinks the
+		data) then base64, in 4096-byte chunks (m=1).
+		Used over ssh.
+
+All commands carry q=1, so the terminal stays quiet except for
+errors.
+
+Frames are paced:
+
+  - at most fps=n frames a second (60); damage arriving meanwhile
+    accumulates.
+  - each frame is wrapped in synchronized output (CSI ?2026h ...
+    ?2026l) when the terminal has it, so it never shows half a
+    frame.
+  - each frame is followed by CSI 5n, and the writer keeps at most
+    one frame in flight: it waits for the status report of the
+    previous one before writing the next.  A slow terminal (or
+    link) therefore gets fewer, larger frames instead of a growing
+    backlog.  If no answer comes in 3 s flow control is turned off.
+
+Errors.  Graphics errors are logged.  ENOENT and ENOPARENT mean
+the terminal lost our images (a reset, or a terminal that evicts
+images under memory pressure); drawterm then resends everything,
+at most once a second.
+
+Image ids start at 0x44540000 ("DT") so they do not clash with
+anybody else's.
+
+
+DAMAGE
+------
+flushmemscreen adds its rectangle to a list of up to 32; a new
+rectangle is merged with an old one when the union wastes less
+than 32x32 pixels, and when the list is full the pair whose union
+grows least is merged.  The writer then cuts each rectangle at
+tile boundaries and keeps one bounding box per tile.
+
+kern/devdraw.c (applies to every drawterm backend): for a draw
+message devdraw used to report the whole destination rectangle as
+damage, but programs often pass r = screen->r and let a small
+source clip it (catclock draws its eyes and tail this way), so
+every tick damaged the whole screen.  devdraw now clips r the way
+memdraw does (drawclipnorepl) and reports only what was drawn.
+catclock went from all 15 tiles a tick to 2.
+
+
+THE PLAN 9 CURSOR
+-----------------
+The terminal's pointer cannot be changed to an arbitrary bitmap,
+so the Plan 9 cursor is drawn as a 16x16 RGBA image (f=32, z=1,
+above the screen) placed at the mouse position and moved by
+placing it again (a=p with x,y,w,h cropping at the edges and X,Y
+for the offset within a cell).  setcursor retransmits the image.
+mouseset cannot warp the host pointer, so it only moves the drawn
+cursor.
+
+cursor=n: 0 never draws it, 1 always, 2 (the default) not while
+it is the arrow, since the terminal's own pointer is a fine arrow.
+Other cursors (rio's sweep cross, the menu box, programs' own) are
+drawn, with the host pointer still visible on top: see TODO.
+
+
+KEYBOARD
+--------
+With the kitty keyboard protocol every key reports press, repeat
+and release, including bare modifiers.  These go to kbdkey as
+Plan 9 runes, i.e. to /dev/kbd as 'r'/'R' messages, so kbdfs sees
+real key ups and downs: Alt alone starts a compose sequence as on
+a Plan 9 terminal, and Shift, Ctl and Mod4 are tracked by kbdfs.
+
+Mapping (CSI code[:shifted[:base]];mods[:event];text u, and the
+legacy-shaped CSI 1;mods A..S and CSI n;mods ~):
+
+  - The associated text, when there is some and Ctl is not held,
+    is used as the rune.  This gives the layout's characters, dead
+    keys and IME output.
+  - Otherwise the code: Escape, Enter, Tab, Backspace map to Kesc,
+    '\n', '\t', Kbs; arrows, Home, End, PgUp, PgDn, Ins, Del, F1-F12
+    to the Plan 9 keys; keypad keys to their characters or
+    movement keys; Shift, Ctl, Alt, Super (left and right) to
+    Kshift, Kctl, Kalt, Kmod4; ISO level 3 shift to Kaltgr; media
+    keys to Kpause, Ksfwd, Ksbwd, Kvoldn, Kvolup, Kmute.  F13 and
+    up, Hyper, Meta and Caps Lock are dropped.
+  - With Shift and no text, the shifted alternate is used; with
+    Ctl, ASCII runes become control characters (r & 0x1f).
+  - Each held key is remembered by its physical id, so its release
+    sends the rune its press sent even if the modifiers changed in
+    between (press a, press Shift, release a).
+  - On focus loss everything held is released, so a key that went
+    up in another window does not stay down; if Alt was held a
+    press and release of Alt follows, as gui-x11 does.
+
+Terminals without the protocol (and the probe window before it is
+enabled) fall back to legacy decoding: UTF-8 bytes are typed whole
+(down and up), CR is '\n', DEL is Kbs, CSI/SS3 arrows and tilde keys
+are mapped, and a lone ESC becomes Kesc after 30 ms.  No releases
+and no bare modifiers, so no Alt compose.
+
+Bracketed paste is typed rune by rune; CRLF becomes '\n' and other
+control characters are dropped.
+
+
+MOUSE
+-----
+Modes 1003, 1006 and 1016 give SGR reports with coordinates in
+pixels for every motion.  Buttons 1-3 map to Plan 9 buttons 1, 2
+and 4, the vertical wheel to 8 and 16 (a press and a release), and
+each terminal button remembers which Plan 9 button its press sent
+so the release matches.  The horizontal wheel, buttons 8 and up
+and kitty's "left the window" report are ignored.  Without 1016
+cell coordinates are used, aimed at the middle of the cell.
+
+emu: Alt-click is button 2 and Ctl-click is button 3, for one-
+button pointing devices; the Alt release of an Alt-click is
+followed by an Alt press and release so it does not leave a
+compose sequence pending.
+
+
+RESIZING
+--------
+The Plan 9 screen is the terminal's text area rounded down to
+whole cells, because placements are addressed by cell.  The size
+comes from, in order of preference:
+
+  - in-band reports (mode 2048, CSI 48;rows;cols;hpx;wpx t),
+    which are exact and arrive in order with everything else; when
+    the terminal has them SIGWINCH is ignored.
+  - SIGWINCH and TIOCGWINSZ, using its pixel size when set,
+    otherwise the cell size from CSI 16t, otherwise the text area
+    from CSI 14t.
+
+A new pixel size goes through screenresize (rio and the console
+follow).  A new cell size with the same pixel size only moves
+placements and triggers a full resend.
+
+
+CLIPBOARD
+---------
+clipwrite (Plan 9 snarf) is sent to the host clipboard with
+OSC 52 and kept locally.  clipread returns the local copy; with
+the clipread option it asks the terminal with OSC 52 ;c;? first
+and waits up to 2 s, because terminals usually prompt or refuse
+clipboard reads.  Pasting with the terminal's own paste key always
+works: it arrives as a bracketed paste and is typed.
+
+
+PANICS AND EXIT
+---------------
+The kernel hangs after a panic to keep the message on the screen.
+The reader watches for that: the end of a session comes as
+panic("ending"), on which drawterm restores the terminal and
+exits; any other panic is put in the window title and the next
+key restores the terminal and exits with the message on stderr.
+If the terminal goes away (hangup, EOF) drawterm exits.
+
+
+DEBUGGING
+---------
+DTKITTY=debug=/tmp/dt.log logs the probe results, sizes, every
+frame (full or not, tiles sent, bytes), key ups and downs and
+graphics errors, with timestamps in ms.  For example:
+
+  terminal 'ghostty 1.4.0': da=1 gfx=1 shm=1 frames=1 kbd=1
+      pixels=1 sync=1 inband=1 ack=1 cell=10x19 text=1280x798
+  size 128x42 cells of 10x19
+  frame full=0 frames=1 tiles=1/15 cursor=0/0 bytes=110
+
+shm, noshm, frames, noframes, tile=n, fps=n, z=n and cursor=n
+force the choices the probe would make, which helps to tell a
+terminal bug from ours.
+
+
+MEASUREMENTS
+------------
+On a 2-CPU VM against a 9front cpu server, Ghostty 1.4.0 under
+Xvfb with software GL (llvmpipe):
+
+  - a keystroke at the console: 1 of 15 tiles, about 110 bytes
+    through the tty with shared memory.
+  - catclock at 2560x1596, 5 fps: Ghostty's renderer thread
+    (image copy before upload) spent 71-80 ms/s with one screen
+    image and 12-40 ms/s with tiles.  Software rasterization
+    (about 1.5 CPUs either way) dominated the totals, so these
+    numbers are only indicative of what a GPU machine saves.
+  - rotzoomer (the whole screen changes every frame) at 1280x798:
+    about 21 fps whichever the mode; tiles neither help nor hurt
+    when everything changes.
+
+
+TESTED
+------
+  Ghostty 1.4.0 (Linux, X11)	frames, shm, everything above
+  Ghostty 1.3.1 (Linux, X11)	no a=f: tiles sent whole
+  kitty 0.49.2 (Linux, X11)	frames, shm
+  libghostty-vt at v1.4.0	headless, for scripted tests
+
+Under test were the console, rio (menus, sweeping windows,
+resizing), catclock and rotzoomer, typing and compose, the
+clipboard, terminal resizes and session end.  The macOS arm64
+binary is built in CI but has not been run in Ghostty on a Mac by
+us.  WezTerm, Konsole, iTerm2 and others are untested.
+
+
+KNOWN PROBLEMS (NOT IN THIS BACKEND)
+------------------------------------
+  - At the bare console (no rio), keys typed faster than the
+    console echoes them can be lost.  The remote aux/kbdfs drops
+    runes it cannot hand over at once (nbsend on an unbuffered
+    channel); under rio they go through a buffered channel and
+    nothing is lost.  The same happens with other backends.
+  - drawterm's exit status at the end of a session is taken from
+    the first character of the remote status (upstream rcpu).
+
+
+TODO
+----
+Roughly in order of value for Ghostty users.
+
+  - HiDPI.  Terminals report device pixels, so on a Retina screen
+    the Plan 9 screen has twice the pixels a window would and its
+    fonts look small.  A scale=2 option should draw gscreen at
+    half size and double the pixels in drawterm: letting the
+    terminal scale the image (placing it over c,r cells) blurs it,
+    because Ghostty samples images linearly.  Mouse coordinates
+    divide by the same factor.
+
+  - Hide the host pointer while a Plan 9 cursor other than the
+    arrow is drawn.  Today both show.  Ghostty 1.4 has no way to
+    hide it from an application (OSC 22 has no blank shape there);
+    this needs a terminal feature, or OSC 22 shapes that
+    approximate Plan 9's common cursors.
+
+  - Upstream: the backend and the devdraw fix are not yet offered
+    to 9front.  Ghostty could also update textures in place
+    (glTexSubImage2D or the Metal equivalent) on a=f; then the
+    single-image path would be as cheap as tiles and could become
+    the default again.
+
+  - Skip unchanged pixels.  rio and libdraw often redraw what is
+    already there.  Keeping a copy of what was sent and shrinking
+    each tile's box to the pixels that differ would cut traffic
+    over ssh, where every byte is base64 over the link.
+
+  - Scrolling.  A scroll arrives as damage over the whole text
+    area and is resent.  Copying within the terminal (a=c
+    composition) could do it, but devdraw does not tell the
+    backend a draw was a copy, and Ghostty rejects a=c with
+    overlapping source and destination in one image, so scrolls
+    would have to be done tile to tile.
+
+  - Better compression for remote use: PNG (f=100) or a faster
+    codec choice per tile, measured against zlib level 1.
+
+  - tmux and screen: drawterm refuses to run inside them.  The
+    kitty protocol's Unicode placeholders (U=1) with tmux
+    passthrough could make it work there.
+
+  - Clipboard reads without a prompt: look at the kitty clipboard
+    protocol (OSC 5522), which Ghostty has started to implement.
+
+  - Input left out: the horizontal wheel, mouse buttons 8 and up,
+    F13 and up (Plan 9 has no keys for them).  Keys the terminal
+    binds for itself (copy, paste, new tab, ...) never reach
+    drawterm and must be unbound in the terminal's configuration;
+    shift-click is usually kept by the terminal for selection.
+
+  - Audio: built with AUDIO=none, so there is no /dev/audio.  One
+    of the existing posix audio backends could be linked in, at
+    the cost of a dependency.
+
+  - Window label: drawterm has no /dev/label; the title stays
+    "drawterm".  Setting it from rio's label would need one.
+
+  - Other terminals: try WezTerm, Konsole, iTerm2 and others, and
+    adjust the probe for what they get wrong.
+
+  - Windows (ConPTY) is not supported: the backend is POSIX
+    (termios, shm_open, select).
