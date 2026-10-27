@@ -62,7 +62,7 @@ jobs:
           fi
           name="drawterm-kitty-$version-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp drawterm drawterm.1 README LICENSE "dist/$name/"
+          cp drawterm drawterm.1 README README.kitty LICENSE "dist/$name/"
           strip "dist/$name/drawterm"
           if [[ "$RUNNER_OS" == macOS ]]; then
             # strip invalidates the linker's ad-hoc signature, and
