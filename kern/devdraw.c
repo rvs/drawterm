@@ -1485,7 +1485,7 @@ drawmesg(Client *client, void *av, int n)
 	uchar *u, *a;
 	char *fmt;
 	ulong value, chan;
-	Rectangle r, clipr;
+	Rectangle r, clipr, sr, mr;
 	Point p, q, *pp, sp;
 	Memimage *i, *bg, *dst, *src, *mask;
 	Memimage *l, **lp;
@@ -1622,7 +1622,12 @@ drawmesg(Client *client, void *av, int n)
 			mask = drawimage(client, ni);
 			op = drawclientop(client);
 			memdraw(dst, r, src, p, mask, q, op);
-			dstflush(dstid, dst, r);
+			/*
+			 * flush what memdraw drew, not all of r:
+			 * programs draw small images with r = screen->r.
+			 */
+			if(drawclipnorepl(dst, &r, src, &p, mask, &q, &sr, &mr))
+				dstflush(dstid, dst, r);
 			continue;
 
 		/* toggle debugging: 'D' val[1] */
