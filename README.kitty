@@ -279,6 +279,38 @@ follow).  A new cell size with the same pixel size only moves
 placements and triggers a full resend.
 
 
+SCALING (-x)
+------------
+Terminals report sizes in device pixels (Ghostty says so in
+src/renderer/size.zig), so on a Retina screen a window has twice
+the pixels in each direction that the same window would have on
+an ordinary screen, and Plan 9's bitmap fonts, borders, menus and
+16x16 cursor come out half size.  -x n makes each Plan 9 pixel an
+n×n block of the terminal's pixels:
+
+  - gscreen is the text area (whole cells) divided by n, rounded
+    down, so the image covers up to n-1 fewer pixels than the
+    cells do.  All the scaling happens in drawterm: placing a
+    small image over more cells would let the terminal scale it,
+    and Ghostty samples images linearly, which blurs them.
+  - damage is in gscreen's pixels and is multiplied by n before
+    it is matched against the tiles, which stay in the terminal's
+    pixels (whole cells, as before).  torgb repeats each pixel n
+    times along a row and copies the row n times.
+  - the cursor image is 16n×16n, and its crop at the edges is
+    multiplied by n.
+  - mouse positions are divided by n.
+
+The terminal gets as many bytes as it would at 1:1; Plan 9 draws
+n² times fewer pixels.  The factor is fixed at startup: -x n
+(8 at most), or with -x alone (or -x 1, which means the same in
+cpu.c) 2 when the cells are at least 28 pixels tall (Hidpi) and
+1 otherwise.  No escape sequence tells a program the display's
+scale, and cell height is a guess: a 1x screen with a large font
+can cross it, so give the number when it matters.  The guess is
+not redone when the font changes.  Without -x nothing changes.
+
+
 CLIPBOARD
 ---------
 clipwrite (Plan 9 snarf) is sent to the host clipboard with
@@ -360,14 +392,6 @@ KNOWN PROBLEMS (NOT IN THIS BACKEND)
 TODO
 ----
 Roughly in order of value for Ghostty users.
-
-  - HiDPI.  Terminals report device pixels, so on a Retina screen
-    the Plan 9 screen has twice the pixels a window would and its
-    fonts look small.  A scale=2 option should draw gscreen at
-    half size and double the pixels in drawterm: letting the
-    terminal scale the image (placing it over c,r cells) blurs it,
-    because Ghostty samples images linearly.  Mouse coordinates
-    divide by the same factor.
 
   - Hide the host pointer while a Plan 9 cursor other than the
     arrow is drawn.  Today both show.  Ghostty 1.4 has no way to

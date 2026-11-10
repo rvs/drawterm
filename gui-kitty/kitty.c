@@ -87,6 +87,7 @@ waitfd(int a, int b, int ms, int *ra, int *rb)
 
 extern void	exits(char*);	/* from user.h, which we cannot include */
 extern int	panicking;	/* kern/devcons.c */
+extern int	scalef;		/* -x, cpu.c */
 
 typedef struct Buf Buf;
 typedef struct Csi Csi;
@@ -137,6 +138,8 @@ enum
 	Ndown		= 64,
 	Tilesz		= 256,
 	Maxtiles	= 1024,
+	Hidpi		= 28,		/* cells this tall mean a dense screen */
+	Maxscale	= 8,
 
 	/* kitty keyboard flags: disambiguate, events, alternates, all keys, text */
 	Kbdflags	= 1|2|4|8|16,
@@ -178,9 +181,10 @@ static struct
 	int	probecw, probech;	/* CSI 16 t */
 	int	probew, probeh;		/* CSI 14 t */
 
-	/* geometry */
+	/* geometry, in the terminal's pixels */
 	int	cols, rows;
-	int	cw, ch;			/* cell size in pixels */
+	int	cw, ch;			/* cell size */
+	int	scale;			/* a plan 9 pixel is scale×scale of them */
 
 	/* options */
 	int	optshm;			/* -1 auto, 0 never, 1 always */
@@ -233,6 +237,7 @@ static struct
 	.fd = -1,
 	.logfd = -1,
 	.debugfd = -1,
+	.scale = 1,
 	.lk = PTHREAD_MUTEX_INITIALIZER,
 	.cond = PTHREAD_COND_INITIALIZER,
 };
@@ -579,24 +584,43 @@ cellat(Buf *b, Point p)
 	return Pt(p.x%kt.cw, p.y%kt.ch);
 }
 
-/* XRGB32 to packed RGB, which kitty calls f=24 */
+/*
+ * XRGB32 to packed RGB, which kitty calls f=24.  r is in the
+ * terminal's pixels, of which each pixel of m covers sc×sc.
+ */
 static void
-torgb(uchar *d, Memimage *m, Rectangle r)
+torgb(uchar *d, Memimage *m, Rectangle r, int sc)
 {
 	uchar *s;
-	int x, y, w;
+	int x, y, w, n;
 
 	w = Dx(r);
 	for(y = r.min.y; y < r.max.y; y++){
-		s = byteaddr(m, Pt(r.min.x, y));
+		if(y > r.min.y && y/sc == (y-1)/sc){
+			/* the same row of m again */
+			memmove(d, d-3*w, 3*w);
+			d += 3*w;
+			continue;
+		}
+		s = byteaddr(m, Pt(r.min.x/sc, y/sc));
+		n = r.min.x%sc;
 		for(x = 0; x < w; x++){
 			d[0] = s[2];
 			d[1] = s[1];
 			d[2] = s[0];
 			d += 3;
-			s += 4;
+			if(++n == sc){
+				n = 0;
+				s += 4;
+			}
 		}
 	}
+}
+
+static Rectangle
+scalerect(Rectangle r, int sc)
+{
+	return Rect(r.min.x*sc, r.min.y*sc, r.max.x*sc, r.max.y*sc);
 }
 
 /*
@@ -635,9 +659,10 @@ outproc(void *v)
 	static Rectangle *box;
 	static int *sent;
 	static int nsent;
-	Rectangle d[Ndirty], r, t, sc;
-	int nd, full, shape, move, i, j, k, n, tw, th, ntx, nty, frames;
-	uchar *mark, rgba[16*16*4], *p;
+	uchar *rgba;
+	Rectangle d[Ndirty], r, t, sc, dsc;
+	int nd, full, shape, move, i, j, k, n, tw, th, ntx, nty, frames, s, cs, x, y;
+	uchar *mark, *p;
 	Point pt, off, curoff;
 	Cursorinfo c;
 	ulong now, last, gap;
@@ -649,6 +674,11 @@ outproc(void *v)
 	last = 0;
 	mark = nil;
 	curoff = ZP;
+	s = kt.scale;
+	cs = 16*s;
+	rgba = malloc(cs*cs*4);
+	if(rgba == nil)
+		panic("kitty: out of memory");
 	for(;;){
 		pthread_mutex_lock(&kt.lk);
 		while(!kt.full && kt.ndirty == 0 && !kt.curshape && !kt.curmove && kt.pend.n == 0)
@@ -706,14 +736,16 @@ outproc(void *v)
 			continue;
 		}
 		sc = gscreen->r;
+		dsc = scalerect(sc, s);
 
 		/*
 		 * what to send: the damage within each tile, or
 		 * all of it when it is new or cannot be edited.
+		 * damage is in plan 9 pixels, tiles in the terminal's.
 		 */
-		tiling(sc, &tw, &th);
-		ntx = (Dx(sc)+tw-1)/tw;
-		nty = (Dy(sc)+th-1)/th;
+		tiling(dsc, &tw, &th);
+		ntx = (Dx(dsc)+tw-1)/tw;
+		nty = (Dy(dsc)+th-1)/th;
 		mark = realloc(mark, ntx*nty);
 		box = realloc(box, ntx*nty*sizeof box[0]);
 		sent = realloc(sent, ntx*nty*sizeof sent[0]);
@@ -726,11 +758,12 @@ outproc(void *v)
 			r = d[i];
 			if(!rectclip(&r, sc))
 				continue;
+			r = scalerect(r, s);
 			for(j = r.min.y/th; j <= (r.max.y-1)/th; j++)
 				for(k = r.min.x/tw; k <= (r.max.x-1)/tw; k++){
 					n = j*ntx + k;
 					t = Rect(k*tw, j*th, (k+1)*tw, (j+1)*th);
-					rectclip(&t, sc);
+					rectclip(&t, dsc);
 					if(full || !frames)
 						box[n] = t;
 					else if(!mark[n]){
@@ -759,7 +792,7 @@ outproc(void *v)
 		p = (uchar*)pix.p;
 		for(i = 0; i < nsent; i++){
 			r = box[sent[i]];
-			torgb(p, gscreen, r);
+			torgb(p, gscreen, r, s);
 			p += Dx(r)*Dy(r)*3;
 		}
 		qunlock(&drawlock);
@@ -772,10 +805,12 @@ outproc(void *v)
 			kt.curhide = kt.optcursor == 0
 				|| kt.optcursor == 2 && memcmp(c.clr, arrow.clr, sizeof c.clr) == 0
 				&& memcmp(c.set, arrow.set, sizeof c.set) == 0;
-			for(i = 0; i < 16*16; i++){
+			for(y = 0; y < cs; y++)
+			for(x = 0; x < cs; x++){
+				i = (y/s)*16 + x/s;
 				j = (i/16)*2 + (i%16)/8;
 				k = 0x80 >> (i%8);
-				p = rgba + 4*i;
+				p = rgba + 4*(y*cs + x);
 				if(c.set[j] & k){
 					p[0] = p[1] = p[2] = 0;
 					p[3] = 0xFF;
@@ -810,8 +845,8 @@ outproc(void *v)
 
 		if(shape && !kt.curhide){
 			/* retransmission drops the old placement */
-			snprint(keys, sizeof keys, "a=t,i=%d,s=16,v=16,f=32,q=1", Idcursor);
-			gfxdata(&b, keys, rgba, sizeof rgba);
+			snprint(keys, sizeof keys, "a=t,i=%d,s=%d,v=%d,f=32,q=1", Idcursor, cs, cs);
+			gfxdata(&b, keys, rgba, cs*cs*4);
 			kt.curshown = 0;
 		}
 		if(move && !kt.curhide){
@@ -819,9 +854,10 @@ outproc(void *v)
 			j = r.min.x < 0 ? -r.min.x : 0;
 			k = r.min.y < 0 ? -r.min.y : 0;
 			if(rectclip(&r, sc)){
+				r = scalerect(r, s);
 				off = cellat(&b, r.min);
 				bprint(&b, "\033_Ga=p,i=%d,p=1,x=%d,y=%d,w=%d,h=%d,X=%d,Y=%d,C=1,z=1,q=1\033\\",
-					Idcursor, j, k, Dx(r), Dy(r), off.x, off.y);
+					Idcursor, j*s, k*s, Dx(r), Dy(r), off.x, off.y);
 				kt.curshown = 1;
 			}else if(kt.curshown){
 				bprint(&b, "\033_Ga=d,d=i,i=%d,p=1,q=2\033\\", Idcursor);
@@ -1231,6 +1267,8 @@ sgrmouse(Csi *c, int release)
 		x = (x-1)*kt.cw + kt.cw/2;
 		y = (y-1)*kt.ch + kt.ch/2;
 	}
+	x /= kt.scale;
+	y /= kt.scale;
 	kt.curpt = Pt(x, y);
 	if(b & 64){
 		if(release || (b & 32))
@@ -1699,6 +1737,10 @@ resize(int cols, int rows, int w, int h)
 	ch = h/rows;
 	if(cw <= 0 || ch <= 0)
 		return;
+	/* only whole cells: placements are addressed by cell */
+	r = Rect(0, 0, cols*cw/kt.scale, rows*ch/kt.scale);
+	if(Dx(r) <= 0 || Dy(r) <= 0)
+		return;
 	pthread_mutex_lock(&kt.lk);
 	if(cols == kt.cols && rows == kt.rows && cw == kt.cw && ch == kt.ch){
 		pthread_mutex_unlock(&kt.lk);
@@ -1708,8 +1750,6 @@ resize(int cols, int rows, int w, int h)
 	kt.rows = rows;
 	kt.cw = cw;
 	kt.ch = ch;
-	/* only whole cells: placements are addressed by cell */
-	r = Rect(0, 0, cols*cw, rows*ch);
 	same = gscreen == nil || eqrect(r, gscreen->r);
 	if(same){
 		/* same pixels, different cells: placements move */
@@ -1984,6 +2024,27 @@ options(void)
 }
 
 /*
+ * -x n: a plan 9 pixel is n×n pixels of the terminal.  -x alone
+ * (or 1) guesses: terminals count device pixels, so tall cells
+ * mean a dense screen, like a Mac's, where 2 is right.
+ * set once: the guess must not change when the font does.
+ */
+static int
+scaling(void)
+{
+	int s;
+
+	s = scalef;
+	if(s == 1)
+		s = kt.ch >= Hidpi ? 2 : 1;
+	if(s < 1)
+		s = 1;
+	if(s > Maxscale)
+		s = Maxscale;
+	return s;
+}
+
+/*
  * the interface to the rest of drawterm
  */
 void
@@ -1998,8 +2059,12 @@ screeninit(void)
 	winsize();
 	if(kt.cols <= 0 || kt.cw <= 0)
 		panic("kitty: cannot tell the size of the terminal in pixels");
+	kt.scale = scaling();
+	dbg("scale %d (-x %d)", kt.scale, scalef);
 	memimageinit();
-	r = Rect(0, 0, kt.cols*kt.cw, kt.rows*kt.ch);
+	r = Rect(0, 0, kt.cols*kt.cw/kt.scale, kt.rows*kt.ch/kt.scale);
+	if(Dx(r) <= 0 || Dy(r) <= 0)
+		panic("kitty: the terminal is too small for -x %d", kt.scale);
 	screensize(r, XRGB32);
 	if(gscreen == nil)
 		panic("kitty: no memory for the screen");
@@ -2026,6 +2091,7 @@ screensize(Rectangle r, ulong chan)
 		freememimage(gscreen);
 	gscreen = i;
 	gscreen->clipr = ZR;
+	dbg("screen %dx%d at scale %d", Dx(r), Dy(r), kt.scale);
 	pthread_mutex_lock(&kt.lk);
 	kt.full = 1;
 	kt.ndirty = 0;
