@@ -35,7 +35,7 @@ jobs:
           - target: linux-arm64
             os: ubuntu-24.04-arm
           - target: macos-arm64
-            os: macos-15
+            os: macos-latest 
     env:
       # oldest macOS the binary will run on
       MACOSX_DEPLOYMENT_TARGET: '11.0'
